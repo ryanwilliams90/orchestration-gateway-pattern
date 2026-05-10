@@ -1,31 +1,30 @@
 """
-Bounded executor — the async/sync boundary.
+The async/sync boundary.
 
-Async handlers submit a synchronous callable (a workflow run) and `await` its
-completion. The submission is bounded by a fixed pool size, with admission
-control enforced explicitly so that saturation manifests as observable queue
-depth rather than as creeping latency on the event loop.
+Async handlers submit a synchronous callable and ``await`` its completion.
+Submission is bounded on two axes — concurrent workers and queued
+admissions — so saturation is observable rather than emergent.
 
-Three properties this module exists to enforce:
+The properties this module enforces:
 
-1. Concurrency is capped by the pool size. There is no implicit ceiling from
-   asyncio scheduling; the cap is the number you configured.
+- Concurrency cap. ``max_workers`` is a hard ceiling; the cap is the number
+  the operator configured, not whatever the event loop happens to schedule.
+- Admission cap. ``max_queue_depth`` rejects submissions when the wait queue
+  is full, with ``ExecutorRejected``. Without this, the underlying
+  ``ThreadPoolExecutor`` queues unboundedly under sustained overload and
+  the process OOMs before the queue-depth gauge catches up.
+- Submitter-side timeout. ``asyncio.wait_for`` cancels the await; the
+  underlying thread continues to run because ``concurrent.futures`` cannot
+  cancel arbitrary blocking work. Counter bookkeeping is preserved by the
+  worker's ``finally``, and the histogram records both the submitter's
+  abandonment and the worker's eventual completion under separate outcome
+  labels.
+- ContextVar propagation. ``loop.run_in_executor`` does not copy the
+  current context across the executor boundary; this module captures it at
+  submit time and restores it inside the worker via ``ctx.run``.
 
-2. Timeout is enforced from the *submitter's* side via `asyncio.wait_for`. The
-   underlying thread continues to run after timeout — Python provides no
-   portable mechanism to cancel arbitrary blocking code — but the submitter
-   stops waiting and counter bookkeeping is preserved (the worker's `finally`
-   block decrements counters and emits the duration metric with the actual
-   elapsed time, not the timeout threshold).
-
-3. ContextVars (request id, correlation id) propagate into the worker thread.
-   `loop.run_in_executor` does not copy context by default; this module does.
-
-Concurrency note on the gauge updates: counter increments and the
-corresponding `gauge.set()` calls are performed under the same lock acquisition
-so that gauge values remain consistent with the counter state. Without this,
-two threads could each compute a depth value under their own lock acquisition
-and then race to call `set()`, with the older value winning the race.
+Counter mutations and the derived ``gauge.set`` calls are performed under
+the same lock so a stale derived value can't clobber a fresh one.
 """
 
 from __future__ import annotations
@@ -53,41 +52,52 @@ R = TypeVar("R")
 
 
 class ExecutorTimeout(TimeoutError):
-    """Raised when a submitted task exceeds its per-call deadline.
+    """The submitter exceeded its per-call deadline.
 
-    The underlying thread is *not* cancelled. The caller should treat the
-    executor slot as occupied until the work eventually completes; admission
-    control is the right place to defend against runaway tasks, not cancellation.
+    The underlying thread is *not* cancelled; the slot is treated as
+    occupied until the work eventually completes. Defending against runaway
+    tasks is the job of admission control and time budgets, not cancellation.
     """
 
 
 class ExecutorRejected(RuntimeError):
-    """Raised when admission is refused (e.g. pool is shutting down)."""
+    """Submission refused.
+
+    Raised when the executor is shut down or the wait queue is full.
+    """
 
 
 class BoundedExecutor:
-    """
-    Thread-pool executor wrapped for async submission, with explicit metrics
-    instrumentation and ContextVar propagation.
+    """Thread-pool executor with admission control and instrumentation.
 
-    The pool size is a deployment-time decision driven by per-workflow memory
-    footprint, the upstream provider's concurrency ceiling, and the pod's CPU
-    request — not request volume alone. See the case study for reasoning.
+    Pool sizing is a deployment-time decision driven by per-task memory,
+    upstream concurrency limits, and CPU/memory requests — not request
+    volume alone. Queue sizing should reflect how much overload the gateway
+    is willing to absorb before shedding load; a queue that's too large
+    just delays the rejection signal until memory is gone.
     """
 
-    def __init__(self, *, name: str, max_workers: int) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        max_workers: int,
+        max_queue_depth: int = 0,
+    ) -> None:
         if max_workers < 1:
             raise ValueError("max_workers must be >= 1")
+        if max_queue_depth < 0:
+            raise ValueError("max_queue_depth must be >= 0 (0 disables admission control)")
         self._name = name
         self._max_workers = max_workers
+        self._max_queue_depth = max_queue_depth
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix=f"gateway-{name}",
         )
-        # `_active` and `_submitted` are mutated from worker threads and the
-        # event-loop thread. `threading.Lock` guards both the counters and the
-        # gauge.set() call that derives from them, so the gauge value always
-        # reflects the locked-in counter state.
+        # Counters are mutated from worker threads and the event loop. The
+        # lock guards both the counters and the gauge.set call that derives
+        # from them, keeping the gauge consistent with the counter state.
         self._active = 0
         self._submitted = 0
         self._counters = threading.Lock()
@@ -101,9 +111,15 @@ class BoundedExecutor:
     def max_workers(self) -> int:
         return self._max_workers
 
+    @property
+    def max_queue_depth(self) -> int:
+        return self._max_queue_depth
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def queue_depth(self) -> int:
-        # Submitted-but-not-yet-running. Holding the lock for the read keeps
-        # the counter pair consistent with what an observer would see.
         with self._counters:
             return max(0, self._submitted - self._active)
 
@@ -118,38 +134,48 @@ class BoundedExecutor:
         timeout: float,
         **kwargs: Any,
     ) -> R:
-        """
-        Submit a synchronous callable for execution on the worker pool.
+        """Submit ``fn(*args, **kwargs)`` for execution; wait up to ``timeout``.
 
         The current ContextVar context is captured and restored inside the
-        worker thread, so request ids and other correlation context flow
-        through without explicit threading.
-        """
-        if self._closed:
-            executor_rejections.labels(pool=self._name, reason="closed").inc()
-            raise ExecutorRejected(f"executor {self._name!r} is shut down")
+        worker thread.
 
+        Raises ``ExecutorRejected`` if the executor is closed or the wait
+        queue is at capacity. Raises ``ExecutorTimeout`` if the worker
+        doesn't finish in time. The exception raised by ``fn`` itself
+        propagates unchanged.
+        """
         ctx = contextvars.copy_context()
         bound = functools.partial(fn, *args, **kwargs)
 
+        # Admission and submitted-counter increment happen under the same
+        # lock so that the cap check and the increment are atomic — no
+        # race in which two submitters both see "queue not full" and then
+        # both increment past the cap.
         with self._counters:
+            if self._closed:
+                executor_rejections.labels(pool=self._name, reason="closed").inc()
+                raise ExecutorRejected(f"executor {self._name!r} is shut down")
+
+            if self._max_queue_depth > 0:
+                queued = max(0, self._submitted - self._active)
+                if queued >= self._max_queue_depth:
+                    executor_rejections.labels(pool=self._name, reason="queue_full").inc()
+                    raise ExecutorRejected(
+                        f"executor {self._name!r} queue full: {queued} waiting "
+                        f"(cap {self._max_queue_depth})"
+                    )
+
             self._submitted += 1
             depth = max(0, self._submitted - self._active)
             executor_queue_depth.labels(pool=self._name).set(depth)
 
         loop = asyncio.get_running_loop()
         started = time.perf_counter()
-        future = loop.run_in_executor(self._executor, _runner, ctx, bound, self)
+        future = loop.run_in_executor(self._executor, self._run_in_worker, ctx, bound)
 
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
-            # The thread keeps running; we stop waiting. The worker's `finally`
-            # block in `_runner` will emit the actual elapsed duration when the
-            # work eventually completes — so we record only the submitter-side
-            # timeout event here, with the wall-clock elapsed at the moment of
-            # giving up. This avoids double-counting and keeps the histogram
-            # honest about *when the submitter abandoned the wait*.
             elapsed = time.perf_counter() - started
             executor_task_duration.labels(pool=self._name, outcome="submitter_timeout").observe(
                 elapsed
@@ -164,68 +190,49 @@ class BoundedExecutor:
                 f"task in pool {self._name!r} exceeded {timeout:.2f}s deadline"
             ) from exc
 
+    def _run_in_worker(
+        self,
+        ctx: contextvars.Context,
+        fn: Callable[[], R],
+    ) -> R:
+        """Run inside the worker thread: restore context, instrument duration.
+
+        Counter increments here are paired with the ``submit``-side
+        increment; the ``finally`` block decrements both ``_active`` and
+        ``_submitted`` so a submitter timeout cannot leak counter state.
+        """
+        with self._counters:
+            self._active += 1
+            depth = max(0, self._submitted - self._active)
+            executor_queue_depth.labels(pool=self._name).set(depth)
+        executor_active_workers.labels(pool=self._name).inc()
+
+        started = time.perf_counter()
+        outcome = "ok"
+        try:
+            return ctx.run(fn)
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            executor_task_duration.labels(pool=self._name, outcome=outcome).observe(elapsed)
+            with self._counters:
+                self._active -= 1
+                self._submitted -= 1
+                depth = max(0, self._submitted - self._active)
+                executor_queue_depth.labels(pool=self._name).set(depth)
+            executor_active_workers.labels(pool=self._name).dec()
+
     async def aclose(self) -> None:
         """Stop accepting new tasks and wait for in-flight work to drain.
 
-        Calling ``aclose`` more than once is safe — the underlying
-        ``ThreadPoolExecutor.shutdown(wait=True)`` is idempotent and the
-        ``_closed`` flag is monotonic.
+        Idempotent. ``ThreadPoolExecutor.shutdown(wait=True)`` is run on the
+        default executor so the event loop stays responsive while workers
+        finish. Multi-pool deployments that close concurrently share that
+        default executor — if pool count approaches ``min(32, cpu_count+4)``,
+        shutdowns serialize and drain time grows linearly. Stagger if needed.
         """
         self._closed = True
-        # `shutdown(wait=True)` is blocking; run it on the default executor so
-        # the event loop stays responsive while workers finish.
-        #
-        # Caveat for multi-pool deployments: every BoundedExecutor that closes
-        # concurrently submits a blocking shutdown call to the *same* default
-        # executor (an unconfigured ThreadPoolExecutor with size
-        # `min(32, cpu_count + 4)`). If the number of named pools approaches
-        # that bound, shutdowns serialize behind it and graceful drain time
-        # grows linearly with pool count. Production deployments with many
-        # pools should stagger close() calls or supply a dedicated executor
-        # for shutdown work.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._executor.shutdown, True)
-
-
-def _runner(
-    ctx: contextvars.Context,
-    fn: Callable[[], R],
-    pool: BoundedExecutor,
-) -> R:
-    """
-    Runs inside the worker thread. Restores context, instruments duration.
-
-    This is intentionally a module-level free function (rather than a method
-    on ``BoundedExecutor``) so that ``loop.run_in_executor`` can dispatch it
-    without tripping over instance-bound-method serialization edge cases.
-    The ``pool`` argument carries the executor reference explicitly; the
-    private-attribute access (``pool._counters`` etc.) is the cost of that
-    decoupling and is contained to this single function.
-    """
-    with pool._counters:
-        pool._active += 1
-        depth = max(0, pool._submitted - pool._active)
-        executor_queue_depth.labels(pool=pool._name).set(depth)
-    executor_active_workers.labels(pool=pool._name).inc()
-
-    started = time.perf_counter()
-    outcome = "ok"
-    try:
-        return ctx.run(fn)
-    except Exception:
-        outcome = "error"
-        raise
-    finally:
-        elapsed = time.perf_counter() - started
-        # Duration is observed with the *actual* elapsed time, even if the
-        # submitter has already given up via timeout. The submitter recorded
-        # its own observation under the `submitter_timeout` outcome label; this
-        # one records what the worker actually did. Together they tell the
-        # full story of timed-out-but-still-running work.
-        executor_task_duration.labels(pool=pool._name, outcome=outcome).observe(elapsed)
-        with pool._counters:
-            pool._active -= 1
-            pool._submitted -= 1
-            depth = max(0, pool._submitted - pool._active)
-            executor_queue_depth.labels(pool=pool._name).set(depth)
-        executor_active_workers.labels(pool=pool._name).dec()

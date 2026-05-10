@@ -466,3 +466,119 @@ async def test_task_duration_metric_records_submitter_timeout(
     # observation is emitted. We don't assert on the value here — that's
     # already covered by the success-path test.
     assert finished.wait(timeout=2.0)
+
+
+# ----- Admission control --------------------------------------------------
+
+
+def test_constructor_rejects_negative_queue_depth() -> None:
+    with pytest.raises(ValueError, match="max_queue_depth"):
+        BoundedExecutor(name="x", max_workers=1, max_queue_depth=-1)
+
+
+async def test_admission_rejects_when_queue_is_full() -> None:
+    """
+    Pool size 1, queue cap 1: one task can run, one can wait, the third
+    must be rejected with ExecutorRejected and reason='queue_full'. This
+    is the bound the README claims and the OOM defence under sustained
+    overload.
+    """
+    ex = BoundedExecutor(name="cap", max_workers=1, max_queue_depth=1)
+    started_sem = threading.Semaphore(0)
+    release = threading.Event()
+
+    def held() -> None:
+        started_sem.release()
+        release.wait(timeout=5.0)
+
+    loop = asyncio.get_running_loop()
+    try:
+        running = asyncio.create_task(ex.submit(held, timeout=5.0))
+        await loop.run_in_executor(None, started_sem.acquire)
+
+        # The pool is full (1 active). Submit one more — fits in the queue.
+        queued = asyncio.create_task(ex.submit(held, timeout=5.0))
+        # Wait for queue depth to reach 1 deterministically.
+        for _ in range(50):
+            if ex.queue_depth() == 1:
+                break
+            await asyncio.sleep(0.005)
+        assert ex.queue_depth() == 1
+
+        # Third submission must be rejected: queue is full.
+        with pytest.raises(ExecutorRejected, match="queue full"):
+            await ex.submit(lambda: None, timeout=1.0)
+
+        release.set()
+        await asyncio.gather(running, queued)
+    finally:
+        await ex.aclose()
+
+
+async def test_queue_full_increments_rejection_metric() -> None:
+    ex = BoundedExecutor(name="cap-metric", max_workers=1, max_queue_depth=1)
+    started_sem = threading.Semaphore(0)
+    release = threading.Event()
+
+    def held() -> None:
+        started_sem.release()
+        release.wait(timeout=5.0)
+
+    loop = asyncio.get_running_loop()
+    try:
+        running = asyncio.create_task(ex.submit(held, timeout=5.0))
+        await loop.run_in_executor(None, started_sem.acquire)
+        queued = asyncio.create_task(ex.submit(held, timeout=5.0))
+        for _ in range(50):
+            if ex.queue_depth() == 1:
+                break
+            await asyncio.sleep(0.005)
+
+        before = REGISTRY.get_sample_value(
+            "executor_rejections_total",
+            labels={"pool": "cap-metric", "reason": "queue_full"},
+        )
+        with pytest.raises(ExecutorRejected):
+            await ex.submit(lambda: None, timeout=1.0)
+        after = REGISTRY.get_sample_value(
+            "executor_rejections_total",
+            labels={"pool": "cap-metric", "reason": "queue_full"},
+        )
+        assert (after or 0) - (before or 0) == 1.0
+
+        release.set()
+        await asyncio.gather(running, queued)
+    finally:
+        await ex.aclose()
+
+
+async def test_zero_queue_depth_disables_admission_control() -> None:
+    """
+    ``max_queue_depth=0`` (the default) disables the cap; any number of
+    submissions can queue. This preserves the prior behavior for callers
+    who haven't opted in.
+    """
+    ex = BoundedExecutor(name="uncapped", max_workers=1, max_queue_depth=0)
+    started_sem = threading.Semaphore(0)
+    release = threading.Event()
+
+    def held() -> None:
+        started_sem.release()
+        release.wait(timeout=5.0)
+
+    loop = asyncio.get_running_loop()
+    try:
+        running = asyncio.create_task(ex.submit(held, timeout=5.0))
+        await loop.run_in_executor(None, started_sem.acquire)
+        # Submit five more; none should be rejected.
+        queued = [asyncio.create_task(ex.submit(held, timeout=5.0)) for _ in range(5)]
+        for _ in range(50):
+            if ex.queue_depth() >= 5:
+                break
+            await asyncio.sleep(0.005)
+        assert ex.queue_depth() == 5
+
+        release.set()
+        await asyncio.gather(running, *queued)
+    finally:
+        await ex.aclose()
