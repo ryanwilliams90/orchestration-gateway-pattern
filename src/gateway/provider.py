@@ -28,7 +28,7 @@ import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from gateway.metrics import (
     provider_call_duration,
@@ -99,7 +99,16 @@ class Provider(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    """Bounded exponential backoff with full jitter."""
+    """Bounded exponential backoff with full jitter.
+
+    `max_delay` has an enforced upper bound (`MAX_REASONABLE_DELAY`) so that
+    a typo or misconfiguration cannot produce a retry that holds an executor
+    thread for an unreasonable amount of time. The executor's submitter-side
+    timeout is the outer deadline, but a thread that's sleeping inside a
+    retry won't be reclaimed until the sleep ends.
+    """
+
+    MAX_REASONABLE_DELAY: ClassVar[float] = 60.0
 
     max_attempts: int = 4
     base_delay: float = 0.25
@@ -112,6 +121,12 @@ class RetryPolicy:
             raise ValueError("base_delay and max_delay must be non-negative")
         if self.max_delay < self.base_delay:
             raise ValueError("max_delay must be >= base_delay")
+        if self.max_delay > self.MAX_REASONABLE_DELAY:
+            raise ValueError(
+                f"max_delay {self.max_delay}s exceeds the reasonable cap "
+                f"{self.MAX_REASONABLE_DELAY}s — a retry sleep this long will "
+                f"hold an executor thread well past any sane request budget"
+            )
 
     def delay_for(self, attempt: int) -> float:
         """Delay before attempt N (1-indexed). Full jitter per AWS guidance."""
@@ -129,6 +144,15 @@ class ProviderWrapper:
         retry_policy: RetryPolicy | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        # `provider.name` becomes a Prometheus label on every metric the
+        # wrapper emits. An empty or whitespace-only label produces samples
+        # that won't match label matchers like `provider!=""` and silently
+        # disappear from dashboards. Fail fast at construction.
+        if not provider.name or not provider.name.strip():
+            raise ValueError(
+                "provider.name must be a non-empty string; metrics labels "
+                "depend on it being a stable, identifying value"
+            )
         self._provider = provider
         self._retry = retry_policy or RetryPolicy()
         # `sleep` is parameterized so tests can inject a no-op without
@@ -226,6 +250,13 @@ class FakeProvider:
         return self._calls
 
     def invoke(self, model: str, prompt: str) -> ProviderResponse:
+        # Real providers reject empty model identifiers with their own
+        # validation error. Mirror that contract so test fixtures don't
+        # silently mask "we forgot to set the model" bugs.
+        if not model:
+            raise Unrecoverable("model must be a non-empty string")
+        if not prompt:
+            raise Unrecoverable("prompt must be a non-empty string")
         self._calls += 1
         if self._calls <= self._fail_first:
             raise self._failure(f"injected {self._failure.__name__} on call {self._calls}")
