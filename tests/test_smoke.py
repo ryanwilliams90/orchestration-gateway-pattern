@@ -88,6 +88,7 @@ def test_smoke_real_uvicorn_serves_full_path(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(REPO_ROOT),
+        text=True,
     )
 
     base = f"http://127.0.0.1:{port}"
