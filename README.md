@@ -2,7 +2,7 @@
 
 A reference implementation of the async/sync executor-boundary pattern for placing a synchronous, framework-driven agent runtime behind a FastAPI service.
 
-> **Python 3.11+** · `mypy --strict` clean · `ruff` clean · 82 contract-driven tests including a real-uvicorn smoke test
+> **Python 3.11+** · `mypy --strict` clean · `ruff` clean · 80+ contract-driven tests including a real-uvicorn smoke test
 
 This repo is a **distilled pattern**, not a production system. It is the companion code to the [Production AI Orchestration Gateway](https://github.com/ryanwilliams90/portfolio/blob/main/case-studies/01-ai-orchestration-gateway.md) case study and exists so a reader can check that the architecture described there is grounded in working code.
 
