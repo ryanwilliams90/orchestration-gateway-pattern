@@ -14,12 +14,18 @@ Three properties this module exists to enforce:
 2. Timeout is enforced from the *submitter's* side via `asyncio.wait_for`. The
    underlying thread continues to run after timeout — Python provides no
    portable mechanism to cancel arbitrary blocking code — but the submitter
-   stops waiting and the executor slot is treated as occupied until the work
-   actually finishes. This is honest about what `concurrent.futures` can and
-   cannot do.
+   stops waiting and counter bookkeeping is preserved (the worker's `finally`
+   block decrements counters and emits the duration metric with the actual
+   elapsed time, not the timeout threshold).
 
 3. ContextVars (request id, correlation id) propagate into the worker thread.
    `loop.run_in_executor` does not copy context by default; this module does.
+
+Concurrency note on the gauge updates: counter increments and the
+corresponding `gauge.set()` calls are performed under the same lock acquisition
+so that gauge values remain consistent with the counter state. Without this,
+two threads could each compute a depth value under their own lock acquisition
+and then race to call `set()`, with the older value winning the race.
 """
 
 from __future__ import annotations
@@ -78,10 +84,10 @@ class BoundedExecutor:
             max_workers=max_workers,
             thread_name_prefix=f"gateway-{name}",
         )
-        # Tracking counters are kept locally (rather than only in Prometheus
-        # gauges) so tests can assert on them without scraping the registry.
-        # The lock is `threading.Lock` because counters are mutated from
-        # worker threads as well as the event-loop thread.
+        # `_active` and `_submitted` are mutated from worker threads and the
+        # event-loop thread. `threading.Lock` guards both the counters and the
+        # gauge.set() call that derives from them, so the gauge value always
+        # reflects the locked-in counter state.
         self._active = 0
         self._submitted = 0
         self._counters = threading.Lock()
@@ -96,13 +102,14 @@ class BoundedExecutor:
         return self._max_workers
 
     def queue_depth(self) -> int:
-        # Submitted-but-not-yet-running. `_submitted` increments at submission
-        # and decrements when work finishes (success, error, or timeout);
-        # `_active` is incremented at the start of execution in the worker.
-        return max(0, self._submitted - self._active)
+        # Submitted-but-not-yet-running. Holding the lock for the read keeps
+        # the counter pair consistent with what an observer would see.
+        with self._counters:
+            return max(0, self._submitted - self._active)
 
     def active_workers(self) -> int:
-        return self._active
+        with self._counters:
+            return self._active
 
     async def submit(
         self,
@@ -128,21 +135,30 @@ class BoundedExecutor:
         with self._counters:
             self._submitted += 1
             depth = max(0, self._submitted - self._active)
-        executor_queue_depth.labels(pool=self._name).set(depth)
+            executor_queue_depth.labels(pool=self._name).set(depth)
 
         loop = asyncio.get_running_loop()
+        started = time.perf_counter()
         future = loop.run_in_executor(self._executor, _runner, ctx, bound, self)
 
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
-            # The thread keeps running; we stop waiting. Record the outcome
-            # so saturation due to timed-out-but-still-running work is visible.
-            executor_task_duration.labels(pool=self._name, outcome="timeout").observe(timeout)
+            # The thread keeps running; we stop waiting. The worker's `finally`
+            # block in `_runner` will emit the actual elapsed duration when the
+            # work eventually completes — so we record only the submitter-side
+            # timeout event here, with the wall-clock elapsed at the moment of
+            # giving up. This avoids double-counting and keeps the histogram
+            # honest about *when the submitter abandoned the wait*.
+            elapsed = time.perf_counter() - started
+            executor_task_duration.labels(pool=self._name, outcome="submitter_timeout").observe(
+                elapsed
+            )
             log.warning(
-                "executor task exceeded deadline pool=%s timeout=%.2fs",
+                "executor task exceeded deadline pool=%s timeout=%.2fs elapsed=%.3fs",
                 self._name,
                 timeout,
+                elapsed,
             )
             raise ExecutorTimeout(
                 f"task in pool {self._name!r} exceeded {timeout:.2f}s deadline"
@@ -152,7 +168,10 @@ class BoundedExecutor:
         """Stop accepting new tasks and wait for in-flight work to drain."""
         self._closed = True
         # `shutdown(wait=True)` is blocking; run it on the default executor so
-        # the event loop stays responsive while workers finish.
+        # the event loop stays responsive while workers finish. Note: if
+        # multiple BoundedExecutor instances close concurrently, they share
+        # the default executor pool — for production deployments with many
+        # named pools, prefer staggered shutdown.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._executor.shutdown, True)
 
@@ -166,8 +185,8 @@ def _runner(
     with pool._counters:
         pool._active += 1
         depth = max(0, pool._submitted - pool._active)
+        executor_queue_depth.labels(pool=pool._name).set(depth)
     executor_active_workers.labels(pool=pool._name).inc()
-    executor_queue_depth.labels(pool=pool._name).set(depth)
 
     started = time.perf_counter()
     outcome = "ok"
@@ -178,10 +197,15 @@ def _runner(
         raise
     finally:
         elapsed = time.perf_counter() - started
+        # Duration is observed with the *actual* elapsed time, even if the
+        # submitter has already given up via timeout. The submitter recorded
+        # its own observation under the `submitter_timeout` outcome label; this
+        # one records what the worker actually did. Together they tell the
+        # full story of timed-out-but-still-running work.
         executor_task_duration.labels(pool=pool._name, outcome=outcome).observe(elapsed)
         with pool._counters:
             pool._active -= 1
             pool._submitted -= 1
             depth = max(0, pool._submitted - pool._active)
+            executor_queue_depth.labels(pool=pool._name).set(depth)
         executor_active_workers.labels(pool=pool._name).dec()
-        executor_queue_depth.labels(pool=pool._name).set(depth)
