@@ -28,6 +28,7 @@ import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import ClassVar, Protocol
 
 from gateway.metrics import (
@@ -69,16 +70,25 @@ class Unrecoverable(NormalizedError):
 # ---- Provider protocol and response shape ---------------------------------
 
 
+_EMPTY_RAW: Mapping[str, object] = MappingProxyType({})
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderResponse:
-    """Normalized response shape. Provider-specific fields go in `raw` if needed."""
+    """Normalized response shape. Provider-specific extras go in ``raw``.
+
+    ``raw`` is typed as ``Mapping`` and constructed as a ``MappingProxyType``
+    by default so the caller can't mutate it after the response is returned.
+    Implementations populating ``raw`` should pass a fresh dict; the wrapper
+    will not defensively copy.
+    """
 
     text: str
     model: str
     input_tokens: int
     output_tokens: int
     latency_seconds: float
-    raw: Mapping[str, object] = field(default_factory=dict)
+    raw: Mapping[str, object] = field(default_factory=lambda: _EMPTY_RAW)
 
 
 class Provider(Protocol):

@@ -1,18 +1,19 @@
 """
 Lifespan-scoped secret loading.
 
-The case study's central claim about secrets is that they are loaded once, at
-service startup, from a Kubernetes-managed source. The runtime never reaches
-into the environment, the filesystem, or a secret manager on the request
-path.
+Secrets are resolved once, at service startup, from a Kubernetes-managed
+source. The runtime never reaches into the environment, filesystem, or a
+secret manager on the request path; that's both a latency property (no
+per-request variance) and a security property (one auditable code path
+through which credentials enter the process).
 
-This module implements that contract. Two sources are supported, in order:
+Sources, in order:
 
-1. A directory of files (the standard Kubernetes mounted-secret shape).
-2. An environment-variable shim, intended for local development.
+- A directory of files — the standard Kubernetes mounted-secret shape.
+- An environment-variable shim, intended for local development.
 
-If neither is present, startup fails. "Running but misconfigured" is not a
-state the design allows.
+If neither produces anything, startup fails. Running but misconfigured is
+not a state this allows.
 """
 
 from __future__ import annotations
@@ -22,13 +23,21 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class Secrets:
-    """Immutable bag of resolved secrets, frozen at lifespan startup."""
+    """Immutable bag of resolved secrets, frozen at lifespan startup.
+
+    The ``values`` mapping is wrapped in ``MappingProxyType`` so it cannot be
+    mutated through the dataclass — neither by the caller that constructed it
+    nor by any code that obtained a reference to it later. The dataclass's
+    ``frozen=True`` only prevents reassigning the attribute; the proxy is
+    what prevents mutating the underlying dict.
+    """
 
     values: Mapping[str, str]
 
@@ -43,7 +52,7 @@ class Secrets:
 
 
 class SecretMissing(KeyError):
-    """Raised when required state is missing at startup or first-use."""
+    """Raised when a required key is absent."""
 
 
 class SecretSourceUnavailable(RuntimeError):
@@ -55,19 +64,14 @@ def load_secrets(
     mount_path: str | os.PathLike[str] | None = None,
     env_prefix: str | None = None,
 ) -> Secrets:
-    """
-    Load secrets at lifespan startup.
+    """Resolve secrets at lifespan startup.
 
-    Parameters
-    ----------
-    mount_path
-        Directory of files where each filename is a key and contents are the
-        value. Matches the Kubernetes `secret` volume mount layout.
-    env_prefix
-        If set, also reads `{env_prefix}_*` environment variables. Lowercased
-        and stripped of the prefix to form keys. Useful for local development.
+    ``mount_path`` is a directory where each filename is a key and contents
+    are the value (the Kubernetes ``secret`` volume layout). ``env_prefix``
+    matches ``{prefix}_*`` environment variables, lowercased and stripped of
+    the prefix to form keys.
 
-    Both sources may be supplied; the file mount wins on key collision.
+    Both sources may be supplied. The file mount wins on key collision.
     """
     values: dict[str, str] = {}
 
@@ -85,11 +89,14 @@ def load_secrets(
                 f"secret mount path {path!s} does not exist or is not a directory"
             )
         for entry in path.iterdir():
-            # Kubernetes mounts produce dotfile temp links during atomic
-            # updates; skip them rather than treating them as keys.
+            # Kubernetes mounts use ``..data`` symlinks and ``..<timestamp>``
+            # directories during atomic secret rotation. Skip those so the
+            # rotation artifacts aren't mistaken for secret keys.
             if not entry.is_file() or entry.name.startswith(".."):
                 continue
-            values[entry.name] = entry.read_text(encoding="utf-8").rstrip("\n")
+            # ``rstrip("\r\n")`` in case files were committed with CRLF
+            # endings; secrets shouldn't contain trailing whitespace anyway.
+            values[entry.name] = entry.read_text(encoding="utf-8").rstrip("\r\n")
 
     if not values:
         raise SecretSourceUnavailable(
@@ -97,4 +104,4 @@ def load_secrets(
         )
 
     log.info("loaded %d secrets at lifespan startup", len(values))
-    return Secrets(values=dict(values))
+    return Secrets(values=MappingProxyType(dict(values)))

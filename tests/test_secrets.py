@@ -148,3 +148,37 @@ def test_secrets_dataclass_is_frozen() -> None:
     s = Secrets(values={"a": "b"})
     with pytest.raises(AttributeError):
         s.values = {"c": "d"}  # type: ignore[misc]
+
+
+def test_loaded_secrets_values_cannot_be_mutated(tmp_path: Path) -> None:
+    """
+    The mapping returned by ``load_secrets`` is wrapped in
+    ``MappingProxyType`` so the underlying dict cannot be mutated through
+    the dataclass. Without this, a caller could do
+    ``secrets.values['injected'] = 'attacker'`` after lifespan startup.
+    """
+    (tmp_path / "api_token").write_text("s3cret")
+    secrets = load_secrets(mount_path=tmp_path)
+
+    with pytest.raises(TypeError):
+        secrets.values["injected"] = "attacker"  # type: ignore[index]
+
+
+def test_loaded_secrets_independent_of_source_dict(tmp_path: Path) -> None:
+    """
+    Mutating the environment after ``load_secrets`` returns must not
+    change the loaded values. The loader copies what it sees; later
+    changes to the source are invisible to the running process.
+    """
+    import os
+
+    os.environ["INDEPTEST_FOO"] = "before"
+    try:
+        secrets = load_secrets(env_prefix="INDEPTEST")
+        os.environ["INDEPTEST_FOO"] = "after"
+        os.environ["INDEPTEST_NEW"] = "added-after-load"
+        assert secrets.require("foo") == "before"
+        assert secrets.get("new") is None
+    finally:
+        os.environ.pop("INDEPTEST_FOO", None)
+        os.environ.pop("INDEPTEST_NEW", None)
