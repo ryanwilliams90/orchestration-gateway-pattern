@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Opt in to the Node.js 24 runtime for JavaScript actions ahead of the
+# 2026-09 deprecation deadline. Removes the GitHub-side warning on every
+# run and surfaces any incompatibilities before the forced switch.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   check:
     runs-on: ubuntu-latest
