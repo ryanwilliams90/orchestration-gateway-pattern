@@ -105,6 +105,14 @@ class RetryPolicy:
     base_delay: float = 0.25
     max_delay: float = 8.0
 
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.base_delay < 0 or self.max_delay < 0:
+            raise ValueError("base_delay and max_delay must be non-negative")
+        if self.max_delay < self.base_delay:
+            raise ValueError("max_delay must be >= base_delay")
+
     def delay_for(self, attempt: int) -> float:
         """Delay before attempt N (1-indexed). Full jitter per AWS guidance."""
         ceiling = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
@@ -178,8 +186,10 @@ class ProviderWrapper:
             model=model,
             outcome=outcome,
         ).observe(time.perf_counter() - started)
-        # `last_error` is set on every path that exits the loop without
-        # returning; the unreachable-else exists so mypy can prove it.
+        # `last_error` is assigned on every path that exits the loop without
+        # returning. `RetryPolicy.__post_init__` guarantees `max_attempts >= 1`,
+        # so the loop body always executes at least once. The check below
+        # exists for type-narrowing (mypy) and as a defensive backstop.
         if last_error is None:  # pragma: no cover
             raise RuntimeError("retry loop exited without error or success")
         raise last_error
@@ -192,9 +202,9 @@ class FakeProvider:
     """
     In-memory provider for tests and demos.
 
-    Behaves deterministically when constructed with a fixed seed; can be
-    configured to inject `Throttled` or `Transient` failures for the first N
-    calls, which is what the retry tests exercise.
+    Deterministic by construction: same input → same output. Can be configured
+    to inject `Throttled` / `Transient` / `Unrecoverable` failures for the
+    first N calls, which is what the retry tests exercise.
     """
 
     name: str = "fake"
@@ -205,13 +215,11 @@ class FakeProvider:
         latency_seconds: float = 0.01,
         fail_first: int = 0,
         failure: type[NormalizedError] = Throttled,
-        seed: int | None = None,
     ) -> None:
         self._latency = latency_seconds
         self._fail_first = fail_first
         self._failure = failure
         self._calls = 0
-        self._rng = random.Random(seed)
 
     @property
     def call_count(self) -> int:
