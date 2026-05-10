@@ -23,9 +23,26 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class WorkflowRequest:
+    """A workflow invocation request.
+
+    Validation is enforced at construction so that direct callers (tests,
+    library use) get the same invariants as the API layer's Pydantic
+    validation. The defensive checks are layered, not duplicated: the API
+    rejects bad input before the request reaches the runtime, and the
+    runtime rejects bad input even when the API layer is bypassed.
+    """
+
     project: str
     prompt: str
     model: str
+
+    def __post_init__(self) -> None:
+        if not self.project:
+            raise ValueError("project must be a non-empty string")
+        if not self.model:
+            raise ValueError("model must be a non-empty string")
+        if not self.prompt:
+            raise ValueError("prompt must be a non-empty string")
 
 
 @dataclass(frozen=True, slots=True)
