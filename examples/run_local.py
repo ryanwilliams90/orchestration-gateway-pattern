@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import uvicorn
 
-from gateway.app import GatewayConfig, create_app
+from gateway.app import GatewayConfig, configure_logging, create_app
 
 
 def main() -> None:
+    configure_logging()
     app = create_app(
         config=GatewayConfig(
             pool_name="workflows",

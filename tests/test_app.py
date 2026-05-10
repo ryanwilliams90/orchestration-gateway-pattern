@@ -345,19 +345,13 @@ async def test_handler_fails_loudly_if_state_missing(monkeypatch: pytest.MonkeyP
     lifespan misconfigured" produce a fast, clear failure instead of a
     confusing AttributeError.
     """
+    from types import SimpleNamespace
+
     from gateway.app import _get_state  # noqa: PLC0415
 
-    class _FakeRequest:
-        class _App:
-            class _State:
-                pass
-
-            state = _State()
-
-        app = _App()
-
+    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
     with pytest.raises(RuntimeError, match="not initialized"):
-        _get_state(_FakeRequest())  # type: ignore[arg-type]
+        _get_state(fake_request)  # type: ignore[arg-type]
 
 
 # ----- Concurrent traffic --------------------------------------------------
@@ -386,3 +380,128 @@ async def test_concurrent_requests_do_not_corrupt_request_ids(
     results = await asyncio.gather(*(one(rid) for rid in rids))
     for sent, returned in results:
         assert sent == returned, f"request id corrupted: sent={sent!r} returned={returned!r}"
+
+
+# ----- /readyz: liveness vs readiness separation --------------------------
+
+
+async def test_readyz_reports_ready_under_normal_operation(
+    client: httpx.AsyncClient,
+) -> None:
+    r = await client.get("/readyz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ready"
+
+
+async def test_readyz_reports_draining_after_executor_closed() -> None:
+    """
+    Once the executor is closed (graceful shutdown window), /readyz must
+    flip to 503 so Kubernetes removes the pod from service endpoints.
+    /healthz must still return 200 — the process is alive, just draining.
+    """
+
+    def factory(_: Secrets) -> Provider:
+        return FakeProvider(latency_seconds=0.0)
+
+    app = create_app(
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=5.0),
+        provider_factory=factory,
+    )
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            from gateway.app import _STATE_KEY  # noqa: PLC0415
+
+            state = getattr(app.state, _STATE_KEY)
+            await state.executor.aclose()
+
+            healthz = await c.get("/healthz")
+            assert healthz.status_code == 200, "liveness must remain 200 during drain"
+
+            readyz = await c.get("/readyz")
+            assert readyz.status_code == 503
+            assert readyz.json()["status"] == "draining"
+
+
+# ----- Logging integration ------------------------------------------------
+
+
+async def test_request_id_propagates_into_log_records(
+    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Log records emitted during request handling must carry the request id
+    via the RequestIdFilter. Without this, log correlation across services
+    is impossible — the response header alone doesn't help an operator
+    grepping logs for a failed request.
+    """
+    from gateway.tracing import RequestIdFilter  # noqa: PLC0415
+
+    rid = "rid-log-test"
+    rid_filter = RequestIdFilter()
+    caplog.handler.addFilter(rid_filter)
+
+    with caplog.at_level("INFO"):
+        r = await client.post(
+            "/v1/run",
+            json={"project": "demo", "model": "m", "prompt": "hello"},
+            headers={"x-request-id": rid},
+        )
+    assert r.status_code == 200
+
+    runtime_records = [rec for rec in caplog.records if rec.name == "gateway.runtime"]
+    assert runtime_records, "expected at least one log record from gateway.runtime"
+    assert all(getattr(rec, "request_id", None) == rid for rec in runtime_records), (
+        f"request_id missing or wrong on records: "
+        f"{[(r.name, getattr(r, 'request_id', None)) for r in runtime_records]}"
+    )
+
+
+# ----- Cancellation -------------------------------------------------------
+
+
+async def test_cancellation_propagates_and_is_logged() -> None:
+    """
+    When the awaiting coroutine is cancelled (client disconnect, ASGI
+    shutdown), the middleware must record the outcome as 'cancelled' and
+    re-raise. CancelledError must NOT be swallowed by the middleware's
+    `except Exception` clause — that would convert a cancellation into a
+    500 response and leave a worker thread running with no awareness that
+    the upstream gave up.
+    """
+    from prometheus_client import REGISTRY  # noqa: PLC0415
+
+    def factory(_: Secrets) -> Provider:
+        return FakeProvider(latency_seconds=0.5)
+
+    app = create_app(
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=10.0),
+        provider_factory=factory,
+    )
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            before = REGISTRY.get_sample_value(
+                "gateway_request_duration_seconds_count",
+                labels={"route": "/v1/run", "outcome": "cancelled"},
+            )
+
+            task = asyncio.create_task(
+                c.post(
+                    "/v1/run",
+                    json={"project": "demo", "model": "m", "prompt": "hello"},
+                )
+            )
+            # Give the request time to enter the handler before cancelling.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            after = REGISTRY.get_sample_value(
+                "gateway_request_duration_seconds_count",
+                labels={"route": "/v1/run", "outcome": "cancelled"},
+            )
+            assert (after or 0) - (before or 0) >= 1.0, (
+                "cancellation outcome was not recorded by the middleware"
+            )
