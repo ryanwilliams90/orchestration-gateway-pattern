@@ -61,6 +61,24 @@ def test_retry_policy_rejects_inverted_delays() -> None:
         RetryPolicy(base_delay=1.0, max_delay=0.5)
 
 
+def test_retry_policy_rejects_unreasonable_max_delay() -> None:
+    """
+    A `max_delay` larger than the policy's reasonable cap cannot be
+    constructed. This bounds the worst-case time a retry can hold an
+    executor thread, defending against typos like `max_delay=300.0`.
+    """
+    cap = RetryPolicy.MAX_REASONABLE_DELAY
+    with pytest.raises(ValueError, match="reasonable cap"):
+        RetryPolicy(max_delay=cap + 1.0)
+
+
+def test_retry_policy_accepts_max_delay_at_cap() -> None:
+    """The cap itself is allowed (boundary condition)."""
+    cap = RetryPolicy.MAX_REASONABLE_DELAY
+    policy = RetryPolicy(max_delay=cap, base_delay=0.1)
+    assert policy.max_delay == cap
+
+
 def test_retry_policy_full_jitter_envelope() -> None:
     """
     Full-jitter delays are bounded by min(max_delay, base * 2^(n-1)).
@@ -110,6 +128,74 @@ def test_provider_name_is_exposed() -> None:
     """The wrapper exposes provider_name so callers / metrics can label."""
     wrapper = ProviderWrapper(FakeProvider())
     assert wrapper.provider_name == "fake"
+
+
+def test_provider_name_is_forwarded_from_underlying_provider() -> None:
+    """
+    `wrapper.provider_name` returns whatever the underlying provider's
+    `name` attribute holds — no hardcoded fallback. Pin this so the
+    wrapper cannot accidentally substitute a constant under refactor.
+    """
+
+    class CustomProvider:
+        name = "bedrock-us-east-1"
+
+        def invoke(self, model: str, prompt: str) -> ProviderResponse:
+            return ProviderResponse(
+                text="ok",
+                model=model,
+                input_tokens=0,
+                output_tokens=0,
+                latency_seconds=0.0,
+            )
+
+    wrapper = ProviderWrapper(CustomProvider())
+    assert wrapper.provider_name == "bedrock-us-east-1"
+
+
+def test_wrapper_rejects_provider_with_empty_name() -> None:
+    """
+    An empty `provider.name` would produce empty Prometheus labels and
+    silently break dashboard label matchers. The wrapper must fail fast
+    at construction.
+    """
+
+    class NamelessProvider:
+        name = ""
+
+        def invoke(self, model: str, prompt: str) -> ProviderResponse:
+            raise NotImplementedError
+
+    with pytest.raises(ValueError, match="non-empty"):
+        ProviderWrapper(NamelessProvider())
+
+
+def test_wrapper_rejects_provider_with_whitespace_name() -> None:
+    class WhitespaceProvider:
+        name = "   "
+
+        def invoke(self, model: str, prompt: str) -> ProviderResponse:
+            raise NotImplementedError
+
+    with pytest.raises(ValueError, match="non-empty"):
+        ProviderWrapper(WhitespaceProvider())
+
+
+def test_fake_provider_rejects_empty_model() -> None:
+    """
+    The fake mirrors a real provider's contract: empty model is a hard
+    Unrecoverable error. This ensures test fixtures don't accidentally
+    mask a 'forgot to set the model' bug elsewhere.
+    """
+    provider = FakeProvider(latency_seconds=0.0)
+    with pytest.raises(Unrecoverable, match="model"):
+        provider.invoke(model="", prompt="hi")
+
+
+def test_fake_provider_rejects_empty_prompt() -> None:
+    provider = FakeProvider(latency_seconds=0.0)
+    with pytest.raises(Unrecoverable, match="prompt"):
+        provider.invoke(model="m", prompt="")
 
 
 # ----- Retry contract ------------------------------------------------------
