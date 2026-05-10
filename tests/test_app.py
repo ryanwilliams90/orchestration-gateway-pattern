@@ -14,7 +14,7 @@ from asgi_lifespan import LifespanManager
 from httpx import ASGITransport
 
 from gateway.app import GatewayConfig, create_app
-from gateway.provider import FakeProvider, Provider, Throttled
+from gateway.provider import FakeProvider, Provider, Throttled, Unrecoverable
 from gateway.secrets import Secrets
 
 
@@ -125,3 +125,59 @@ async def test_run_returns_504_on_timeout() -> None:
                 json={"project": "demo", "model": "m", "prompt": "hello"},
             )
             assert r.status_code == 504
+
+
+async def test_run_returns_502_on_unrecoverable_provider_error() -> None:
+    """
+    The wrapper's `Unrecoverable` taxonomy maps to 502 Bad Gateway: the
+    upstream returned a permanent failure, so the *gateway* received a bad
+    response, which is what 502 means.
+    """
+
+    def factory(_: Secrets) -> Provider:
+        return FakeProvider(latency_seconds=0.0, fail_first=10, failure=Unrecoverable)
+
+    app = create_app(
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=5.0),
+        provider_factory=factory,
+    )
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.post(
+                "/v1/run",
+                json={"project": "demo", "model": "m", "prompt": "hello"},
+            )
+            assert r.status_code == 502
+
+
+async def test_request_id_survives_handler_exception() -> None:
+    """
+    If a handler raises before producing a response, the middleware must
+    still attach `x-request-id` to whatever response is returned to the
+    client. Losing the header on exception paths breaks correlation
+    exactly when correlation matters most.
+    """
+    rid = "rid-exc-test"
+
+    # Build a minimal app via the same factory and add a route that raises.
+    # The middleware is the unit under test; we don't care about /v1/run here.
+    def factory(_: Secrets) -> Provider:
+        return FakeProvider(latency_seconds=0.0)
+
+    app = create_app(
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=5.0),
+        provider_factory=factory,
+    )
+
+    @app.get("/boom")
+    async def boom() -> dict[str, str]:
+        raise RuntimeError("intentional handler failure")
+
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get("/boom", headers={"x-request-id": rid})
+            assert r.status_code == 500
+            assert r.headers.get("x-request-id") == rid
+            assert r.json().get("request_id") == rid
