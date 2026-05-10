@@ -1,5 +1,7 @@
 # Orchestration Gateway Pattern
 
+[![ci](https://github.com/ryanwilliams90/orchestration-gateway-pattern/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanwilliams90/orchestration-gateway-pattern/actions/workflows/ci.yml)
+
 A reference implementation of the async/sync executor-boundary pattern for placing a synchronous, framework-driven agent runtime behind a FastAPI service.
 
 > **Python 3.11+** · `mypy --strict` clean · `ruff` clean · 90+ contract-driven tests including a real-uvicorn smoke test
