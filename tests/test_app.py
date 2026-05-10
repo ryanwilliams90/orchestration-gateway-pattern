@@ -1,12 +1,30 @@
 """
-End-to-end tests through the FastAPI app. These exercise the integrated
-path: handler → executor → runtime → provider wrapper → fake provider.
+End-to-end tests through the FastAPI app.
 
-`httpx.ASGITransport` lets us drive the app without a real server, which
-keeps tests deterministic and fast.
+These pin contracts the case study and module docstrings make:
+
+- Lifespan startup populates state before traffic is accepted; a startup
+  failure (e.g., missing secrets) prevents the app from serving requests.
+- The middleware attaches `x-request-id` to every response, including
+  responses produced when a handler raises before producing one.
+- A client-supplied `x-request-id` is honored; absence triggers generation.
+- /v1/run maps:
+    ExecutorTimeout    -> 504
+    ExecutorRejected   -> 503
+    Unrecoverable      -> 502
+    invalid payload    -> 422
+- /healthz returns 200 with a status field.
+- /metrics exposes the three documented metric layers.
+
+`httpx.ASGITransport` drives the app without a real server.
+`asgi_lifespan.LifespanManager` triggers the lifespan hook (ASGITransport
+otherwise skips it).
 """
 
 from __future__ import annotations
+
+import asyncio
+import time
 
 import httpx
 import pytest
@@ -14,7 +32,13 @@ from asgi_lifespan import LifespanManager
 from httpx import ASGITransport
 
 from gateway.app import GatewayConfig, create_app
-from gateway.provider import FakeProvider, Provider, Throttled, Unrecoverable
+from gateway.provider import (
+    FakeProvider,
+    Provider,
+    ProviderResponse,
+    Throttled,
+    Unrecoverable,
+)
 from gateway.secrets import Secrets
 
 
@@ -27,7 +51,7 @@ def _factory(*, fail_first: int = 0) -> object:
 
 @pytest.fixture(autouse=True)
 def _set_env_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The default secret loader expects either a mount path or env-prefixed vars.
+    # The default secret loader requires either a mount path or env-prefixed vars.
     monkeypatch.setenv("GATEWAY_TEST_KEY", "value")
 
 
@@ -47,22 +71,47 @@ async def client() -> httpx.AsyncClient:
             yield c
 
 
-async def test_healthz(client: httpx.AsyncClient) -> None:
+# ----- Health and metrics surfaces -----------------------------------------
+
+
+async def test_healthz_returns_ok(client: httpx.AsyncClient) -> None:
     r = await client.get("/healthz")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
 
 
-async def test_metrics_exposed(client: httpx.AsyncClient) -> None:
+async def test_metrics_exposes_three_documented_layers(client: httpx.AsyncClient) -> None:
+    """
+    The case study claim: gateway, executor, and provider each contribute
+    distinct signals. Drive one request through to populate samples, then
+    assert the documented metric names appear with values.
+    """
+    await client.post(
+        "/v1/run",
+        json={"project": "demo", "model": "m", "prompt": "hello"},
+    )
+
     r = await client.get("/metrics")
     assert r.status_code == 200
     body = r.text
-    assert "gateway_request_duration_seconds" in body
+
+    # Gateway layer.
+    assert "gateway_request_duration_seconds_count" in body
+    assert "gateway_in_flight_requests" in body
+    # Executor layer.
     assert "executor_queue_depth" in body
-    assert "provider_call_duration_seconds" in body
+    assert "executor_active_workers" in body
+    assert "executor_task_duration_seconds_count" in body
+    # Provider layer.
+    assert 'provider_call_duration_seconds_count{model="m"' in body
+    assert 'outcome="ok"' in body
+    assert 'provider="fake"' in body
 
 
-async def test_run_happy_path(client: httpx.AsyncClient) -> None:
+# ----- Happy path and request-id propagation -------------------------------
+
+
+async def test_run_happy_path_returns_full_response(client: httpx.AsyncClient) -> None:
     r = await client.post(
         "/v1/run",
         json={"project": "demo", "model": "m", "prompt": "hello"},
@@ -71,11 +120,14 @@ async def test_run_happy_path(client: httpx.AsyncClient) -> None:
     body = r.json()
     assert body["project"] == "demo"
     assert body["provider"] == "fake"
-    assert "request_id" in body
+    assert body["model"] == "m"
     assert "echo[m]" in body["output"]
+    assert isinstance(body["input_tokens"], int)
+    assert isinstance(body["output_tokens"], int)
+    assert isinstance(body["request_id"], str) and len(body["request_id"]) > 0
 
 
-async def test_run_propagates_request_id(client: httpx.AsyncClient) -> None:
+async def test_client_supplied_request_id_is_honored(client: httpx.AsyncClient) -> None:
     rid = "rid-abc-123"
     r = await client.post(
         "/v1/run",
@@ -87,7 +139,35 @@ async def test_run_propagates_request_id(client: httpx.AsyncClient) -> None:
     assert r.json()["request_id"] == rid
 
 
-async def test_run_rejects_invalid_payload(client: httpx.AsyncClient) -> None:
+async def test_request_id_is_generated_when_absent(client: httpx.AsyncClient) -> None:
+    """No header supplied → middleware generates a fresh id and surfaces it."""
+    r = await client.post(
+        "/v1/run",
+        json={"project": "demo", "model": "m", "prompt": "hello"},
+    )
+    rid = r.headers.get("x-request-id")
+    assert rid is not None and len(rid) > 0
+    # The generated id round-trips into the response body.
+    assert r.json()["request_id"] == rid
+
+
+async def test_distinct_requests_get_distinct_generated_ids(client: httpx.AsyncClient) -> None:
+    """Generated ids must not collide; this also catches accidental caching."""
+    r1 = await client.post(
+        "/v1/run",
+        json={"project": "demo", "model": "m", "prompt": "hello"},
+    )
+    r2 = await client.post(
+        "/v1/run",
+        json={"project": "demo", "model": "m", "prompt": "hello"},
+    )
+    assert r1.headers["x-request-id"] != r2.headers["x-request-id"]
+
+
+# ----- Validation ----------------------------------------------------------
+
+
+async def test_run_rejects_empty_project(client: httpx.AsyncClient) -> None:
     r = await client.post(
         "/v1/run",
         json={"project": "", "model": "m", "prompt": "hello"},
@@ -95,27 +175,39 @@ async def test_run_rejects_invalid_payload(client: httpx.AsyncClient) -> None:
     assert r.status_code == 422
 
 
-async def test_run_returns_504_on_timeout() -> None:
-    # A workflow that always exceeds the budget must surface as 504, not 500.
-    import time
+async def test_run_rejects_missing_field(client: httpx.AsyncClient) -> None:
+    r = await client.post("/v1/run", json={"project": "demo", "model": "m"})
+    assert r.status_code == 422
 
-    def slow_provider_factory(_: Secrets) -> Provider:
+
+async def test_run_rejects_oversized_prompt(client: httpx.AsyncClient) -> None:
+    """Prompt size cap exists to bound per-request memory; pin it."""
+    r = await client.post(
+        "/v1/run",
+        json={"project": "demo", "model": "m", "prompt": "x" * 70_000},
+    )
+    assert r.status_code == 422
+
+
+# ----- Error mapping -------------------------------------------------------
+
+
+async def test_run_returns_504_on_executor_timeout() -> None:
+    """A workflow that exceeds the orchestration budget surfaces as 504, not 500."""
+
+    def slow_factory(_: Secrets) -> Provider:
         class SlowProvider:
             name = "slow"
 
-            def invoke(self, model: str, prompt: str):  # type: ignore[no-untyped-def]
+            def invoke(self, model: str, prompt: str) -> ProviderResponse:
                 time.sleep(0.5)
                 raise RuntimeError("unreachable")
 
         return SlowProvider()  # type: ignore[return-value]
 
     app = create_app(
-        config=GatewayConfig(
-            pool_name="t",
-            pool_size=1,
-            workflow_timeout_seconds=0.05,
-        ),
-        provider_factory=slow_provider_factory,
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=0.05),
+        provider_factory=slow_factory,
     )
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
@@ -125,13 +217,14 @@ async def test_run_returns_504_on_timeout() -> None:
                 json={"project": "demo", "model": "m", "prompt": "hello"},
             )
             assert r.status_code == 504
+            # The request id must still be present on error paths.
+            assert "x-request-id" in r.headers
 
 
 async def test_run_returns_502_on_unrecoverable_provider_error() -> None:
     """
-    The wrapper's `Unrecoverable` taxonomy maps to 502 Bad Gateway: the
-    upstream returned a permanent failure, so the *gateway* received a bad
-    response, which is what 502 means.
+    Unrecoverable upstream error → 502 Bad Gateway. The semantics: the
+    *gateway* received a bad response from an upstream dependency.
     """
 
     def factory(_: Secrets) -> Provider:
@@ -149,19 +242,51 @@ async def test_run_returns_502_on_unrecoverable_provider_error() -> None:
                 json={"project": "demo", "model": "m", "prompt": "hello"},
             )
             assert r.status_code == 502
+            assert "x-request-id" in r.headers
 
 
-async def test_request_id_survives_handler_exception() -> None:
+async def test_run_returns_503_after_executor_close() -> None:
+    """
+    A request that arrives after the executor has been closed (e.g.,
+    in-flight during shutdown) maps to ExecutorRejected → 503 Service
+    Unavailable.
+    """
+
+    def factory(_: Secrets) -> Provider:
+        return FakeProvider(latency_seconds=0.0)
+
+    app = create_app(
+        config=GatewayConfig(pool_name="t", pool_size=1, workflow_timeout_seconds=5.0),
+        provider_factory=factory,
+    )
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            # Reach into the running app to close the executor mid-life,
+            # simulating the window between shutdown begin and shutdown
+            # complete where readiness has flipped but the app is still
+            # serving.
+            from gateway.app import _STATE_KEY  # noqa: PLC0415
+
+            state = getattr(app.state, _STATE_KEY)
+            await state.executor.aclose()
+
+            r = await c.post(
+                "/v1/run",
+                json={"project": "demo", "model": "m", "prompt": "hello"},
+            )
+            assert r.status_code == 503
+            assert "x-request-id" in r.headers
+
+
+async def test_request_id_survives_unhandled_handler_exception() -> None:
     """
     If a handler raises before producing a response, the middleware must
-    still attach `x-request-id` to whatever response is returned to the
-    client. Losing the header on exception paths breaks correlation
-    exactly when correlation matters most.
+    still attach `x-request-id`. Losing the header on exception paths
+    breaks correlation exactly when correlation matters most.
     """
     rid = "rid-exc-test"
 
-    # Build a minimal app via the same factory and add a route that raises.
-    # The middleware is the unit under test; we don't care about /v1/run here.
     def factory(_: Secrets) -> Provider:
         return FakeProvider(latency_seconds=0.0)
 
@@ -181,3 +306,83 @@ async def test_request_id_survives_handler_exception() -> None:
             assert r.status_code == 500
             assert r.headers.get("x-request-id") == rid
             assert r.json().get("request_id") == rid
+
+
+# ----- Lifespan contract ---------------------------------------------------
+
+
+async def test_lifespan_failure_blocks_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A lifespan startup that fails (e.g., no secrets resolvable) must prevent
+    the app from accepting traffic. The case study claim: 'running but
+    misconfigured is structurally impossible.' Pin it.
+    """
+    monkeypatch.delenv("GATEWAY_TEST_KEY", raising=False)
+
+    app = create_app(
+        config=GatewayConfig(
+            pool_name="t",
+            pool_size=1,
+            workflow_timeout_seconds=5.0,
+            secret_env_prefix="ABSENT_PREFIX_DEFINITELY_NOT_SET",
+            secret_mount_path=None,
+        ),
+        provider_factory=_factory(),  # type: ignore[arg-type]
+    )
+
+    from gateway.secrets import SecretSourceUnavailable  # noqa: PLC0415
+
+    with pytest.raises(SecretSourceUnavailable):
+        async with LifespanManager(app):
+            # Should never reach here: lifespan startup must fail before yield.
+            pass
+
+
+async def test_handler_fails_loudly_if_state_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The typed state accessor must raise a clear error if the lifespan
+    didn't populate state. This makes "code reached production with
+    lifespan misconfigured" produce a fast, clear failure instead of a
+    confusing AttributeError.
+    """
+    from gateway.app import _get_state  # noqa: PLC0415
+
+    class _FakeRequest:
+        class _App:
+            class _State:
+                pass
+
+            state = _State()
+
+        app = _App()
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _get_state(_FakeRequest())  # type: ignore[arg-type]
+
+
+# ----- Concurrent traffic --------------------------------------------------
+
+
+async def test_concurrent_requests_do_not_corrupt_request_ids(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Ten concurrent requests, each with a distinct supplied id. Each
+    response must carry its own id back, with no cross-talk. This pins
+    the ContextVar isolation property end-to-end through the gateway.
+    """
+    rids = [f"rid-{i:04d}" for i in range(10)]
+
+    async def one(rid: str) -> tuple[str, str]:
+        r = await client.post(
+            "/v1/run",
+            json={"project": "demo", "model": "m", "prompt": rid},
+            headers={"x-request-id": rid},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        return rid, body["request_id"]
+
+    results = await asyncio.gather(*(one(rid) for rid in rids))
+    for sent, returned in results:
+        assert sent == returned, f"request id corrupted: sent={sent!r} returned={returned!r}"
