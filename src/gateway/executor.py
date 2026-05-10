@@ -165,13 +165,24 @@ class BoundedExecutor:
             ) from exc
 
     async def aclose(self) -> None:
-        """Stop accepting new tasks and wait for in-flight work to drain."""
+        """Stop accepting new tasks and wait for in-flight work to drain.
+
+        Calling ``aclose`` more than once is safe — the underlying
+        ``ThreadPoolExecutor.shutdown(wait=True)`` is idempotent and the
+        ``_closed`` flag is monotonic.
+        """
         self._closed = True
         # `shutdown(wait=True)` is blocking; run it on the default executor so
-        # the event loop stays responsive while workers finish. Note: if
-        # multiple BoundedExecutor instances close concurrently, they share
-        # the default executor pool — for production deployments with many
-        # named pools, prefer staggered shutdown.
+        # the event loop stays responsive while workers finish.
+        #
+        # Caveat for multi-pool deployments: every BoundedExecutor that closes
+        # concurrently submits a blocking shutdown call to the *same* default
+        # executor (an unconfigured ThreadPoolExecutor with size
+        # `min(32, cpu_count + 4)`). If the number of named pools approaches
+        # that bound, shutdowns serialize behind it and graceful drain time
+        # grows linearly with pool count. Production deployments with many
+        # pools should stagger close() calls or supply a dedicated executor
+        # for shutdown work.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._executor.shutdown, True)
 
@@ -181,7 +192,16 @@ def _runner(
     fn: Callable[[], R],
     pool: BoundedExecutor,
 ) -> R:
-    """Runs inside the worker thread. Restores context, instruments duration."""
+    """
+    Runs inside the worker thread. Restores context, instruments duration.
+
+    This is intentionally a module-level free function (rather than a method
+    on ``BoundedExecutor``) so that ``loop.run_in_executor`` can dispatch it
+    without tripping over instance-bound-method serialization edge cases.
+    The ``pool`` argument carries the executor reference explicitly; the
+    private-attribute access (``pool._counters`` etc.) is the cost of that
+    decoupling and is contained to this single function.
+    """
     with pool._counters:
         pool._active += 1
         depth = max(0, pool._submitted - pool._active)
