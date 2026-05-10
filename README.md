@@ -2,6 +2,8 @@
 
 A reference implementation of the async/sync executor-boundary pattern for placing a synchronous, framework-driven agent runtime behind a FastAPI service.
 
+> **Python 3.11+** · `mypy --strict` clean · `ruff` clean · 82 contract-driven tests including a real-uvicorn smoke test
+
 This repo is a **distilled pattern**, not a production system. It is the companion code to the [Production AI Orchestration Gateway](https://github.com/ryanwilliams90/portfolio/blob/main/case-studies/01-ai-orchestration-gateway.md) case study and exists so a reader can check that the architecture described there is grounded in working code.
 
 ## What this demonstrates
@@ -41,7 +43,9 @@ tests/
   test_app.py       End-to-end through the ASGI surface
   test_executor.py  Concurrency bounds, timeout honesty, ContextVar propagation
   test_provider.py  Retry semantics, error normalization, jitter envelope
+  test_runtime.py   Workflow request validation, result round-trip
   test_secrets.py   Mount-path and env-prefix loading, immutability
+  test_smoke.py     Real-uvicorn subprocess test driving HTTP through the full stack
 examples/
   run_local.py  Runs the gateway with the FakeProvider
 ```
@@ -72,10 +76,12 @@ curl -s localhost:8080/metrics | grep -E '(gateway|executor|provider)_'
 
 A few things worth pointing out for a careful reader:
 
-- **Timeout honesty.** `concurrent.futures` cannot cancel running tasks. The executor stops waiting on timeout; the underlying thread continues until the work finishes. The `ExecutorTimeout` test pins this behavior, and the case study addresses why this is the right tradeoff (admission control, not cancellation, is the lever).
-- **Counter locking.** `_active` and `_submitted` are mutated from worker threads; a `threading.Lock` guards the increment/decrement and the derived queue-depth gauge. Without it, the depth metric would race under load.
-- **Context propagation.** `loop.run_in_executor` does not copy the current ContextVar context. The executor uses `contextvars.copy_context()` and runs the callable inside `ctx.run()` so request ids flow through.
-- **Mypy strict, ruff clean.** The intent is for this to read like production code, not a sketch. `make all` enforces it.
+- **Timeout honesty.** `concurrent.futures` cannot cancel running tasks. The executor stops waiting on timeout; the underlying thread continues until the work finishes. The `ExecutorTimeout` test pins this behavior, and the case study addresses why this is the right tradeoff (admission control, not cancellation, is the lever). The duration histogram records the submitter's abandonment under one outcome label and the worker's true completion under another, so timed-out-but-still-running work is described accurately.
+- **Counter locking.** `_active` and `_submitted` are mutated from worker threads; a `threading.Lock` guards the increment/decrement *and* the derived queue-depth gauge update. The lock-protected `gauge.set()` is the fix to a torn-read race that would otherwise transiently misreport saturation.
+- **Context propagation.** `loop.run_in_executor` does not copy the current ContextVar context. The executor uses `contextvars.copy_context()` and runs the callable inside `ctx.run()` so request ids flow through. Tests pin capture-at-submit-time, isolation across concurrent submissions, and no leak-back into the event loop.
+- **Provider name validation.** The wrapper rejects providers with empty or whitespace-only `name` at construction. `provider.name` becomes a Prometheus label on every metric the wrapper emits; an empty label produces samples that silently disappear from dashboards.
+- **Layered validation.** `WorkflowRequest` validates non-empty fields at construction so callers that bypass the FastAPI Pydantic layer (tests, library use) get the same invariants the API enforces.
+- **Mypy strict, ruff clean, real-uvicorn smoke test.** `make all` enforces the static checks and the test suite. `tests/test_smoke.py` spawns uvicorn in a subprocess and drives real HTTP, catching wiring issues that `httpx.ASGITransport` hides.
 
 ## Related
 
