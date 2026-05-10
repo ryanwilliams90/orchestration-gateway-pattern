@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orchestration-gateway-pattern"
+version = "0.1.0"
+description = "Reference implementation of the async/sync executor-boundary pattern for synchronous agent runtimes behind a FastAPI gateway."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Williams" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "orjson>=3.9",
+    "prometheus-client>=0.20",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "asgi-lifespan>=2.1",
+    "mypy>=1.8",
+    "ruff>=0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RET"]
+# N818 prefers "Error"-suffixed exception names. The wrapper's normalized
+# error taxonomy (`Throttled`, `Transient`, `Unrecoverable`) reads more
+# naturally without the suffix, mirroring Python's own conventions for
+# condition-shaped exceptions (e.g. `CancelledError` is the exception, but
+# `concurrent.futures.CancelledError` and similar are the precedent).
+ignore = ["N818"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
